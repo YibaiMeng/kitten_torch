@@ -1,22 +1,28 @@
 """
 Generate audio samples comparing ONNX (golden) vs PyTorch implementations.
 Saves WAV files to ./audio_samples/
-"""
-import sys
-sys.path.insert(0, "/home/yibaimeng_gmail_com/src/kitten")
 
+Usage:
+  python generate_audio.py                          # downloads model from HuggingFace
+  python generate_audio.py --onnx /path/to/model.onnx --voices /path/to/voices.npz
+"""
+import argparse
 import os
 import numpy as np
 import soundfile as sf
-import torch
 import onnxruntime as ort
 
 from kitten_torch import KittenTTS
+from kitten_torch.tokenizer import Tokenizer
 
-HF_SNAPSHOT = "/home/yibaimeng_gmail_com/.cache/huggingface/hub/models--KittenML--kitten-tts-nano-0.1/snapshots/7d99aae46867223af52d5ea16d076d8839ce1a2e"
-ONNX_PATH = f"{HF_SNAPSHOT}/kitten_tts_nano_v0_1.onnx"
-VOICES_PATH = f"{HF_SNAPSHOT}/voices.npz"
 SAMPLE_RATE = 24000
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--onnx", default=None, help="Path to .onnx model file")
+parser.add_argument("--voices", default=None, help="Path to voices.npz")
+args = parser.parse_args()
+ONNX_PATH = args.onnx
+VOICES_PATH = args.voices
 
 SENTENCES = [
     "Hello, how are you today?",
@@ -28,34 +34,29 @@ VOICES = ["expr-voice-2-m", "expr-voice-2-f"]
 
 os.makedirs("audio_samples", exist_ok=True)
 
-# ---- Build PT model ----
+# ---- Build PT model (downloads from HuggingFace if paths not given) ----
 print("Loading PyTorch model...")
 tts = KittenTTS(model_path=ONNX_PATH, voices_path=VOICES_PATH)
+
+# Resolve actual paths after possible HF download
+_onnx = ONNX_PATH or tts._model  # tts already loaded; grab paths for ONNX session
+# Re-derive ONNX path if not specified
+if ONNX_PATH is None:
+    from huggingface_hub import hf_hub_download
+    ONNX_PATH = hf_hub_download("KittenML/kitten-tts-nano-0.1", "kitten_tts_nano_v0_1.onnx")
+if VOICES_PATH is None:
+    from huggingface_hub import hf_hub_download
+    VOICES_PATH = hf_hub_download("KittenML/kitten-tts-nano-0.1", "voices.npz")
 
 # ---- Build ONNX session ----
 print("Loading ONNX model...")
 onnx_sess = ort.InferenceSession(ONNX_PATH, providers=["CPUExecutionProvider"])
 voices_data = np.load(VOICES_PATH)
 
-# We need the phonemizer and word index from tts for ONNX too
-import kittentts as _kt, inspect, re
-src = inspect.getsource(_kt.KittenTTS.__init__)
-m = re.search(r"enumerate\(list\('(.+?)'\)\)", src, re.DOTALL)
-WORD_INDEX = {s: i for i, s in enumerate(list(m.group(1)))}
-
-def phonemize_to_ids(tts_instance, text):
-    phonemized = tts_instance._phonemizer.phonemize([text])[0]
-    # Match original kittentts tokenization: normalize whitespace
-    normalized = ' '.join(re.findall(r"\w+|[^\w\s]", phonemized))
-    ids = [0]  # BOS
-    for c in normalized:
-        if c in WORD_INDEX:
-            ids.append(WORD_INDEX[c])
-    ids.append(0)  # EOS
-    return ids
+tok = Tokenizer()
 
 def run_onnx(text, voice, speed=1.0):
-    ids = phonemize_to_ids(tts, text)
+    ids = tok.encode(tts._phonemizer, text)
     input_ids = np.array([ids], dtype=np.int64)
     style_np = voices_data[voice][0:1].astype(np.float32)
     speed_arr = np.array([speed], dtype=np.float32)
