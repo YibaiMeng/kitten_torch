@@ -79,8 +79,8 @@ for voice in VOICES:
         onnx_path = f"audio_samples/{tag}_onnx.wav"
         sf.write(onnx_path, onnx_audio, SAMPLE_RATE)
 
-        # PyTorch
-        pt_audio = tts.generate(sentence, voice=voice, deterministic=False)
+        # PyTorch (deterministic=True matches ONNX: both use zero random phase/noise)
+        pt_audio = tts.generate(sentence, voice=voice, deterministic=True)
         pt_path = f"audio_samples/{tag}_pytorch.wav"
         sf.write(pt_path, pt_audio, SAMPLE_RATE)
 
