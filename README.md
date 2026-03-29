@@ -4,6 +4,12 @@ PyTorch reconstruction of [KittenTTS nano](https://huggingface.co/KittenML/kitte
 
 The goal is a clean, readable PyTorch implementation that produces audio numerically close to the original ONNX, suitable for fine-tuning or further research.
 
+> **Based on kittentts 0.1 / kitten-tts-nano-0.1.**
+> The architecture, weights, and tokenizer were all reverse-engineered from
+> `kitten_tts_nano_v0_1.onnx` as distributed by [KittenML](https://huggingface.co/KittenML)
+> and the `kittentts` pip package (version used during development: 0.1.x).
+> If the upstream ONNX or package changes, this implementation may need updating.
+
 ## Architecture
 
 KittenTTS nano is a StyleTTS2-inspired model with a HiFi-GAN + iSTFT vocoder:
@@ -152,4 +158,8 @@ kitten_torch/
 generate_audio.py      Demo script: generate samples for all voices
 gen_ab_test.py         Generate paired A/B blind test clips
 score_ab_test.py       Score A/B test guesses + binomial p-value
+
+research/              Investigation scripts used during reverse-engineering
+  debug_*.py           Step-by-step ONNX vs PT intermediate comparisons
+  probe_*.py           Injection probes to isolate divergence sources
 ```
