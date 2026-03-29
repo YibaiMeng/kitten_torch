@@ -58,6 +58,6 @@ class Tokenizer:
                 for c in normalized
                 if c in self._word_index
             ]
-            + [0]
+            + [10, 0]  # ONNX2: end-of-text token (index 10 = '…') then pad
         )
         return ids

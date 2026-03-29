@@ -1,13 +1,13 @@
 # kitten-torch
 
-PyTorch reconstruction of [KittenTTS nano](https://huggingface.co/KittenML/kitten-tts-nano-0.1) — a StyleTTS2-based TTS model originally distributed as a quantized ONNX file.
+PyTorch reconstruction of [KittenTTS nano](https://huggingface.co/KittenML/kitten-tts-nano-0.8-int8) — a StyleTTS2-based TTS model originally distributed as a quantized ONNX file.
 
 The goal is a clean, readable PyTorch implementation that produces audio numerically close to the original ONNX, suitable for fine-tuning or further research.
 
-> **Based on kittentts 0.1 / kitten-tts-nano-0.1.**
+> **Based on kitten-tts-nano-0.8-int8.**
 > The architecture, weights, and tokenizer were all reverse-engineered from
-> `kitten_tts_nano_v0_1.onnx` as distributed by [KittenML](https://huggingface.co/KittenML)
-> and the `kittentts` pip package (version used during development: 0.1.x).
+> `kitten_tts_nano_v0_8.onnx` as distributed by [KittenML](https://huggingface.co/KittenML)
+> and the `kittentts` pip package (version used during development: 0.8.x).
 > If the upstream ONNX or package changes, this implementation may need updating.
 
 ## Architecture
@@ -27,7 +27,7 @@ Text → Phonemizer (espeak-ng) → token IDs
                          Predictor
                     ┌────────┴────────┐
                Duration          Text Encoder
-               (BiLSTM)         (6×BiLSTM+AdaIN)
+               (BiLSTM)         (2×BiLSTM+AdaIN)
                     │                │
                Length Regulation (LR expand)
                                      │
@@ -89,7 +89,7 @@ Or with explicit model paths (no HuggingFace download):
 
 ```python
 tts = KittenTTS(
-    model_path="/path/to/kitten_tts_nano_v0_1.onnx",
+    model_path="/path/to/kitten_tts_nano_v0_8.onnx",
     voices_path="/path/to/voices.npz",
 )
 ```
@@ -108,16 +108,14 @@ The vocab has 178 valid entries (indices 0–177). Two characters in the raw voc
 
 ## Quality
 
-After fixing a bug where the generator was conditioned on the wrong style half (`style[:, 128:]` instead of `style[:, :128]`), PT and ONNX produce very close output:
+PT and ONNX produce very close output across tested voices and sentences:
 
 | Metric | Value |
 |--------|-------|
-| Mean amplitude ratio (PT/ONNX) | ~1.02 |
-| Per-sample diff mean | ~0.086 |
+| Duration ratio (PT/ONNX) | 0.97–1.08 |
+| Amplitude ratio (PT/ONNX) | 0.92–1.33 (most near 1.0) |
 
-The residual per-sample difference is quantization noise from the int8 resblock convolutions — not audible as a quality difference.
-
-A blind 2AFC listening test (20 pairs, same phrase + voice, A=ONNX B=PT in random order) found no statistically significant perceptual difference (p ≥ 0.10).
+The residual differences come from quantization noise in the int8 LSTM and resblock operations, plus random phase offsets in the SineGenerator — not audible as a quality difference.
 
 ## Blind Test Scripts
 

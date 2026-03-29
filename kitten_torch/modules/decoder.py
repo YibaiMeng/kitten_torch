@@ -4,10 +4,10 @@ Acoustic Decoder (AdaIN encode + decode blocks).
 Architecture (from ONNX weight analysis):
 
 encode block (single):
-  Input: cat(text_proj=512, F0=1, N=1) = 514 channels
-  conv1x1: Conv1d(514, 256, k=1)  — residual shortcut
-  norm1: AdaIN(514, style_half=128) → fc: Linear(128, 1028=2*514)
-  conv1: Conv1d(514, 256, k=3, pad=1)
+  Input: cat(text_lstm=128, F0=1, N=1) = 130 channels
+  conv1x1: Conv1d(130, 256, k=1)  — residual shortcut
+  norm1: AdaIN(130, style_half=128) → fc: Linear(128, 260=2*130)
+  conv1: Conv1d(130, 256, k=3, pad=1)
   norm2: AdaIN(256, style_half=128) → fc: Linear(128, 512=2*256)
   conv2: Conv1d(256, 256, k=3, pad=1)
   out = conv2 + residual
@@ -25,7 +25,7 @@ decode blocks (×4):
     pool: depthwise ConvTranspose1d(322, 322, k=3, stride=2)
     applied BEFORE main computation to get 2× temporal resolution
 
-asr_res: Conv1d(512, 64, k=1)  — maps text_proj (512) to 64
+asr_res: Conv1d(128, 64, k=1)  — maps text_lstm (128) to 64
 
 F0_conv: Conv1d(1, 1, k=3) — smooth F0 before concat
 N_conv: Conv1d(1, 1, k=3)  — smooth N before concat
@@ -132,7 +132,7 @@ class AcousticDecoder(nn.Module):
     Acoustic decoder: text features + F0/N → acoustic features.
 
     Input:
-        text_enc: (B, T, 512) — from text_encoder.text_proj
+        text_enc: (B, T, 128) — from text_encoder (h_lstm, no text_proj in v0.8)
         f0: (B, 1, T)         — at T frames (first half of 2T F0 predictions)
         n: (B, 1, T)          — energy at T frames
         style: (B, 256)       — voice style embedding
@@ -144,15 +144,15 @@ class AcousticDecoder(nn.Module):
 
     def __init__(self, style_half: int = 128):
         super().__init__()
-        # Map text_proj (512) → 64-dim for decoder concat
-        self.asr_res = nn.Conv1d(512, 64, 1)
+        # Map text_lstm (128) → 64-dim for decoder concat
+        self.asr_res = nn.Conv1d(128, 64, 1)
 
         # Stride-2 convs: downsample F0/N from 2T → T (ONNX verified: stride=2)
         self.F0_conv = nn.Conv1d(1, 1, 3, stride=2, padding=1)
         self.N_conv = nn.Conv1d(1, 1, 3, stride=2, padding=1)
 
-        # Encode block: 514-ch input (512 text + 1 F0 + 1 N)
-        self.encode = AdaINResBlock(514, 256, style_half, upsample=False)
+        # Encode block: 130-ch input (128 text + 1 F0 + 1 N)
+        self.encode = AdaINResBlock(130, 256, style_half, upsample=False)
 
         # Decode blocks: 322-ch input (256 encode + 64 asr_res + 1 F0 + 1 N)
         # decode.3 has 2× temporal upsample
@@ -174,19 +174,19 @@ class AcousticDecoder(nn.Module):
         # ONNX verified: ALL blocks (encode + decode 0-3) use style[:128]
         s1 = style[:, :128]   # (B, 128) — used for ALL blocks
 
-        # text_enc: (B, T, 512) → (B, 512, T)
-        te = text_enc.transpose(1, 2)  # (B, 512, T)
+        # text_enc: (B, T, 128) → (B, 128, T)
+        te = text_enc.transpose(1, 2)  # (B, 128, T)
 
         # f0/n are at 2T resolution from predictor; stride-2 conv downsamples to T
         f0_2T = f0                      # (B, 1, 2T) — kept at 2T for generator
         f0_T = self.F0_conv(f0)         # (B, 1, T) via stride=2
         n_T = self.N_conv(n)            # (B, 1, T) via stride=2
 
-        # Encode: concat text (512) + F0 (1) + N (1) = 514
-        enc_input = torch.cat([te, f0_T, n_T], dim=1)  # (B, 514, T)
+        # Encode: concat text (128) + F0 (1) + N (1) = 130
+        enc_input = torch.cat([te, f0_T, n_T], dim=1)  # (B, 130, T)
         enc_out = self.encode(enc_input, s1)             # (B, 256, T)
 
-        # asr_res: project text_enc (512) to 64
+        # asr_res: project text_enc (128) to 64
         asr = self.asr_res(te)  # (B, 64, T)
 
         # Decode: cat(encode=256, asr=64, F0=1, N=1) = 322 for each block

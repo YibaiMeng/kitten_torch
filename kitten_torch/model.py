@@ -3,17 +3,17 @@ KittenTTS nano — full PyTorch model.
 
 Inference pipeline:
   1. Phonemize text → token IDs (same as original KittenTTS)
-  2. TextEncoder: token IDs → (text_proj=512, text_lstm=128)
+  2. TextEncoder: token IDs → text_lstm=128 (returned twice for API compat; no text_proj in v0.8)
   3. ALBERT: token IDs → bert_out=128
   4. Predictor (phoneme-level):
-     a. Concat(text_lstm, bert_out) → 6×BiLSTM+FC → 256
+     a. Concat(bert_out, style_half) → 2×BiLSTM+FC → 256
      b. Duration LSTM → log-duration bins → frame counts
   5. Length Regulation (LR): expand phoneme features to frame level
   6. Predictor (frame-level):
      a. Shared LSTM → 128
      b. F0/N ResBlocks → F0 at 2T frames, N at 2T frames
   7. Acoustic Decoder:
-     a. Concat(text_proj_512, F0_T, N_T) → encode block → 256
+     a. Concat(text_lstm_128, F0_T, N_T) → encode block → 256
      b. 4× decode blocks with F0/N → 256 at 2T frames
   8. Generator:
      a. SineGenerator from upsampled F0
@@ -83,8 +83,8 @@ class KittenTTSTorch(nn.Module):
         B, T = input_ids.shape
         device = input_ids.device
 
-        # 1. Text encoding
-        text_proj, text_lstm = self.text_encoder(input_ids)  # (B,T,512), (B,T,128)
+        # 1. Text encoding (v0.8: both outputs are 128-dim h_lstm)
+        text_proj, text_lstm = self.text_encoder(input_ids)  # (B,T,128), (B,T,128)
 
         # 2. ALBERT
         bert_out = self.bert(input_ids)                       # (B, T, 128)
@@ -109,8 +109,8 @@ class KittenTTSTorch(nn.Module):
         # n_pred: (B, 1, 2*T_frames)   — energy at 2T resolution
 
         # 6. Acoustic Decoder
-        # text_proj at T_frames (LR-expanded)
-        text_proj_lr = self._length_regulate_proj(text_proj, dur_int)  # (B, T_frames, 512)
+        # text_proj at T_frames (LR-expanded, 128-dim in v0.8)
+        text_proj_lr = self._length_regulate_proj(text_proj, dur_int)  # (B, T_frames, 128)
 
         features, f0_2T = self.decoder(text_proj_lr, f0_pred, n_pred, style)
         # features: (B, 256, 2*T_frames)

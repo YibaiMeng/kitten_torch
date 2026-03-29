@@ -23,6 +23,7 @@ ONNX → PyTorch LSTM weight conversion:
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,76 @@ import torch
 import torch.nn as nn
 
 from .weight_loader import ONNXWeights
+
+
+# ------------------------------------------------------------------ #
+#  Dynamic ONNX tensor name discovery                                  #
+#                                                                      #
+#  ONNX assigns sequential IDs to unnamed nodes (onnx::LSTM_XXXX,     #
+#  onnx::MatMul_XXXX). The IDs differ between model versions if the   #
+#  graph topology changes, but their *order* (sorted numerically)     #
+#  maps deterministically to model components.  Discovering them      #
+#  dynamically makes the loader work with both v0.1 (ONNX1) and       #
+#  v0.8 (ONNX2) without separate codepaths.                           #
+# ------------------------------------------------------------------ #
+
+def _find_lstm_groups(w: ONNXWeights) -> list[int]:
+    """
+    Return sorted list of LSTM bias group numbers.
+
+    Each LSTM group N has initializers:
+      onnx::LSTM_N          — bias (float32, shape (num_dir, 8H))
+      onnx::LSTM_{N+1}_quantized — W_ih (int8)
+      onnx::LSTM_{N+2}_quantized — W_hh (int8)
+
+    There are 5 groups total (text_encoder, 2 predictor, duration, shared).
+    """
+    groups = sorted(
+        int(m.group(1))
+        for name in w.inits
+        if (m := re.match(r'^onnx::LSTM_(\d+)$', name))
+    )
+    if len(groups) != 5:
+        raise RuntimeError(
+            f"Expected 5 LSTM bias groups, found {len(groups)}: {groups}. "
+            "The ONNX model may have a different architecture than expected."
+        )
+    return groups
+
+
+def _find_matmul_quantized(w: ONNXWeights) -> list[int]:
+    """
+    Return sorted list of quantized MatMul group numbers (onnx::MatMul_N_quantized).
+
+    In v0.8-int8 there are 0 quantized MatMul entries (all unnamed MatMuls are float).
+    """
+    return sorted(
+        int(m.group(1))
+        for name in w.inits
+        if (m := re.match(r'^onnx::MatMul_(\d+)_quantized$', name))
+    )
+
+
+def _find_matmul_fp(w: ONNXWeights) -> list[int]:
+    """
+    Return sorted list of float16/float32 MatMul initializer numbers.
+
+    These are onnx::MatMul_N tensors that have *no* corresponding _quantized entry.
+    In v0.8-int8 there are 10 in order:
+      [0]   → bert.embedding_hidden_mapping_in
+      [1-4] → BERT attention q/k/v/dense
+      [5-6] → BERT ffn/ffn_output
+      [7]   → BERT encoder
+      [8]   → predictor.duration_proj
+      [9]   → generator.sine_gen.l_linear
+    """
+    all_names = set(w.inits.keys())
+    return sorted(
+        int(m.group(1))
+        for name in all_names
+        if (m := re.match(r'^onnx::MatMul_(\d+)$', name))
+        and f"onnx::MatMul_{m.group(1)}_quantized" not in all_names
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -177,6 +248,21 @@ def _load_quantized_conv1d(
     module.register_forward_pre_hook(_dql_hook)
 
 
+def _load_conv1d_auto(
+    module: nn.Conv1d,
+    weights: ONNXWeights,
+    prefix: str,
+    b_name: str | None = None,
+) -> None:
+    """Load Conv1d, auto-detecting quantized (_quantized suffix) vs plain float."""
+    if f"{prefix}.weight_quantized" in weights:
+        _load_quantized_conv1d(module, weights, f"{prefix}.weight_quantized", b_name)
+    else:
+        module.weight.data.copy_(weights.get(f"{prefix}.weight"))
+        if b_name and b_name in weights:
+            module.bias.data.copy_(weights.get(b_name))
+
+
 def _load_fp16_weight(module: nn.Module, attr: str, weights: ONNXWeights, name: str) -> None:
     """Load float16 initializer into a parameter, converting to float32."""
     arr = weights.raw(name).astype(np.float32)
@@ -197,11 +283,15 @@ def load_weights(model: nn.Module, onnx_path: str | Path) -> None:
     """
     w = ONNXWeights(onnx_path)
 
-    _load_text_encoder(model.text_encoder, w)
-    _load_bert(model.bert, w)
-    _load_predictor(model.predictor, w)
+    # Discover unnamed tensor IDs dynamically
+    lstm_groups = _find_lstm_groups(w)       # 5 groups sorted
+    matmul_fp   = _find_matmul_fp(w)         # 10 groups sorted
+
+    _load_text_encoder(model.text_encoder, w, lstm_groups)
+    _load_bert(model.bert, w, matmul_fp)
+    _load_predictor(model.predictor, w, lstm_groups, matmul_fp)
     _load_decoder(model.decoder, w)
-    _load_generator(model.decoder.generator, w)
+    _load_generator(model.decoder.generator, w, matmul_fp)
 
     # Apply dynamic int8 quantization to all LSTMs (matches ONNX DynamicQuantizeLSTM)
     import torch.ao.quantization as tq
@@ -212,14 +302,14 @@ def load_weights(model: nn.Module, onnx_path: str | Path) -> None:
 #  Text Encoder                                                        #
 # ------------------------------------------------------------------ #
 
-def _load_text_encoder(te, w: ONNXWeights) -> None:
+def _load_text_encoder(te, w: ONNXWeights, lstm_groups: list[int]) -> None:
     prefix = "kmodel.text_encoder"
 
     # Embedding
     te.embedding.weight.data.copy_(w.get(f"{prefix}.embedding.weight"))
 
-    # CNN layers
-    for i in range(6):
+    # CNN layers (v0.8: 2 blocks)
+    for i in range(2):
         cp = f"{prefix}.cnn.{i}"
         _load_quantized_conv1d(
             te.cnn[i].conv, w,
@@ -230,32 +320,26 @@ def _load_text_encoder(te, w: ONNXWeights) -> None:
         te.cnn[i].norm.weight.data.copy_(w.get(f"{cp}.1.gamma"))
         te.cnn[i].norm.bias.data.copy_(w.get(f"{cp}.1.beta"))
 
-    # BiLSTM (LSTM group 7589)
+    # BiLSTM — group[0] in ONNX order
+    g0 = lstm_groups[0]
     _load_lstm_weights(
         te.lstm,
-        w_ih_q=w.raw("onnx::LSTM_7590_quantized"),
-        w_ih_scale=w.raw("onnx::LSTM_7590_scale"),
-        w_ih_zp=w.raw("onnx::LSTM_7590_zero_point"),
-        w_hh_q=w.raw("onnx::LSTM_7591_quantized"),
-        w_hh_scale=w.raw("onnx::LSTM_7591_scale"),
-        w_hh_zp=w.raw("onnx::LSTM_7591_zero_point"),
-        bias=w.raw("onnx::LSTM_7589"),
+        w_ih_q=w.raw(f"onnx::LSTM_{g0 + 1}_quantized"),
+        w_ih_scale=w.raw(f"onnx::LSTM_{g0 + 1}_scale"),
+        w_ih_zp=w.raw(f"onnx::LSTM_{g0 + 1}_zero_point"),
+        w_hh_q=w.raw(f"onnx::LSTM_{g0 + 2}_quantized"),
+        w_hh_scale=w.raw(f"onnx::LSTM_{g0 + 2}_scale"),
+        w_hh_zp=w.raw(f"onnx::LSTM_{g0 + 2}_zero_point"),
+        bias=w.raw(f"onnx::LSTM_{g0}"),
     )
-
-    # text_proj: Linear(128, 512)
-    # Weight: onnx::MatMul_7598_quantized (128, 512)
-    _load_quantized_linear(
-        te.text_proj, w,
-        "onnx::MatMul_7598_quantized",
-        f"{prefix}.text_proj.bias",
-    )
+    # No text_proj in v0.8: decoder takes 128-dim features directly
 
 
 # ------------------------------------------------------------------ #
 #  ALBERT                                                              #
 # ------------------------------------------------------------------ #
 
-def _load_bert(bert, w: ONNXWeights) -> None:
+def _load_bert(bert, w: ONNXWeights, matmul_fp: list[int]) -> None:
     bp = "kmodel.bert"
 
     # Embeddings
@@ -265,31 +349,25 @@ def _load_bert(bert, w: ONNXWeights) -> None:
     bert.emb_ln.weight.data.copy_(w.get(f"{bp}.embeddings.LayerNorm.weight"))
     bert.emb_ln.bias.data.copy_(w.get(f"{bp}.embeddings.LayerNorm.bias"))
 
-    # embedding_hidden_mapping_in: Linear(128→768)
-    # Weight: onnx::MatMul_7606_quantized (128, 768)
-    _load_quantized_linear(
-        bert.embedding_hidden_mapping_in, w,
-        "onnx::MatMul_7606_quantized",
-        f"{bp}.encoder.embedding_hidden_mapping_in.bias",
+    # embedding_hidden_mapping_in: Linear(128→768) — matmul_fp[0] (float16, stored as (in, out))
+    arr = w.raw(f"onnx::MatMul_{matmul_fp[0]}").astype(np.float32)
+    bert.embedding_hidden_mapping_in.weight.data.copy_(torch.from_numpy(arr.T))
+    bert.embedding_hidden_mapping_in.bias.data.copy_(
+        torch.from_numpy(w.raw(f"{bp}.encoder.embedding_hidden_mapping_in.bias").astype(np.float32))
     )
 
     # Albert shared layer attention weights (float16 in ONNX)
+    # matmul_fp[1..4] → query, key, value, dense (each 768×768)
     alp = f"{bp}.encoder.albert_layer_groups.0.albert_layers.0"
     attn = bert.albert_layer.attention
 
-    # query/key/value/dense: float16 (768, 768) stored as (in, out)
-    for param_name, onnx_name in [
-        ("query", "onnx::MatMul_7607"),
-        ("key", "onnx::MatMul_7610"),
-        ("value", "onnx::MatMul_7613"),
-        ("dense", "onnx::MatMul_7617"),
-    ]:
-        arr = w.raw(onnx_name).astype(np.float32)  # (768, 768)
-        getattr(attn, param_name).weight.data.copy_(torch.from_numpy(arr.T))  # (out, in) = (768, 768)
+    for param_name, fp_idx in [("query", 1), ("key", 2), ("value", 3), ("dense", 4)]:
+        arr = w.raw(f"onnx::MatMul_{matmul_fp[fp_idx]}").astype(np.float32)  # (768, 768)
+        getattr(attn, param_name).weight.data.copy_(torch.from_numpy(arr.T))
 
     for param_name, bias_name in [
         ("query", f"{alp}.attention.query.bias"),
-        ("key", f"{alp}.attention.key.bias"),
+        ("key",   f"{alp}.attention.key.bias"),
         ("value", f"{alp}.attention.value.bias"),
         ("dense", f"{alp}.attention.dense.bias"),
     ]:
@@ -300,25 +378,22 @@ def _load_bert(bert, w: ONNXWeights) -> None:
     attn.LayerNorm.weight.data.copy_(w.get(f"{alp}.attention.LayerNorm.weight"))
     attn.LayerNorm.bias.data.copy_(w.get(f"{alp}.attention.LayerNorm.bias"))
 
-    # FFN
+    # FFN — matmul_fp[5..6]
     layer = bert.albert_layer
-    # ffn: float16 (768, 2048) as (in, out)
-    arr = w.raw("onnx::MatMul_7618").astype(np.float32)  # (768, 2048)
-    layer.ffn.weight.data.copy_(torch.from_numpy(arr.T))  # (2048, 768)
+    arr = w.raw(f"onnx::MatMul_{matmul_fp[5]}").astype(np.float32)  # ffn (768, 2048)
+    layer.ffn.weight.data.copy_(torch.from_numpy(arr.T))
     layer.ffn.bias.data.copy_(torch.from_numpy(w.raw(f"{alp}.ffn.bias").astype(np.float32)))
 
-    # ffn_output: (2048, 768) as (in, out)
-    arr = w.raw("onnx::MatMul_7619").astype(np.float32)  # (2048, 768)
-    layer.ffn_output.weight.data.copy_(torch.from_numpy(arr.T))  # (768, 2048)
+    arr = w.raw(f"onnx::MatMul_{matmul_fp[6]}").astype(np.float32)  # ffn_output (2048, 768)
+    layer.ffn_output.weight.data.copy_(torch.from_numpy(arr.T))
     layer.ffn_output.bias.data.copy_(torch.from_numpy(w.raw(f"{alp}.ffn_output.bias").astype(np.float32)))
 
-    # full_layer_layer_norm
     layer.full_layer_layer_norm.weight.data.copy_(w.get(f"{alp}.full_layer_layer_norm.weight"))
     layer.full_layer_layer_norm.bias.data.copy_(w.get(f"{alp}.full_layer_layer_norm.bias"))
 
-    # bert_encoder: Linear(768→128) — float16 (768, 128) as (in, out)
-    arr = w.raw("onnx::MatMul_7763").astype(np.float32)  # (768, 128)
-    bert.bert_encoder.weight.data.copy_(torch.from_numpy(arr.T))  # (128, 768)
+    # bert_encoder: Linear(768→128) — matmul_fp[7]
+    arr = w.raw(f"onnx::MatMul_{matmul_fp[7]}").astype(np.float32)  # (768, 128)
+    bert.bert_encoder.weight.data.copy_(torch.from_numpy(arr.T))
     bert.bert_encoder.bias.data.copy_(w.get("kmodel.bert_encoder.bias"))
 
 
@@ -327,116 +402,113 @@ def _load_bert(bert, w: ONNXWeights) -> None:
 # ------------------------------------------------------------------ #
 
 def _load_adain1d(adain, w: ONNXWeights, prefix: str) -> None:
-    """Load AdaIN1d: norm (weight+bias) + fc (weight+bias)."""
-    adain.norm.weight.data.copy_(w.get(f"{prefix}.norm.weight"))
-    adain.norm.bias.data.copy_(w.get(f"{prefix}.norm.bias"))
-    _load_quantized_linear(adain.fc, w, f"{prefix}.fc.weight_quantized", f"{prefix}.fc.bias")
+    """Load AdaIN1d: norm (weight+bias) + fc (weight+bias).
+
+    Detects int8 (_quantized suffix) vs float weight storage:
+    - int8: weight stored as (in, out) → needs transpose via _load_quantized_linear
+    - float: weight stored as (out, in) → load directly
+    """
+    if f"{prefix}.norm.weight" in w:
+        adain.norm.weight.data.copy_(w.get(f"{prefix}.norm.weight"))
+    if f"{prefix}.norm.bias" in w:
+        adain.norm.bias.data.copy_(w.get(f"{prefix}.norm.bias"))
+    fc_w_quantized = f"{prefix}.fc.weight_quantized"
+    if fc_w_quantized in w:
+        _load_quantized_linear(adain.fc, w, fc_w_quantized, f"{prefix}.fc.bias")
+    else:
+        # float weight stored as (in, out) — transpose to (out, in) for nn.Linear
+        arr = w.raw(f"{prefix}.fc.weight").astype(np.float32)
+        adain.fc.weight.data.copy_(torch.from_numpy(arr.T))
+        adain.fc.bias.data.copy_(torch.from_numpy(w.raw(f"{prefix}.fc.bias").astype(np.float32)))
 
 
 def _load_pred_resblock(blk, w: ONNXWeights, prefix: str) -> None:
     """PredResBlock: norm1, conv1, norm2, conv2."""
     _load_adain1d(blk.norm1, w, f"{prefix}.norm1")
-    _load_quantized_conv1d(blk.conv1, w, f"{prefix}.conv1.weight_quantized", f"{prefix}.conv1.bias")
+    _load_conv1d_auto(blk.conv1, w, f"{prefix}.conv1", f"{prefix}.conv1.bias")
     _load_adain1d(blk.norm2, w, f"{prefix}.norm2")
-    _load_quantized_conv1d(blk.conv2, w, f"{prefix}.conv2.weight_quantized", f"{prefix}.conv2.bias")
+    _load_conv1d_auto(blk.conv2, w, f"{prefix}.conv2", f"{prefix}.conv2.bias")
 
 
 def _load_pred_upsample_block(blk, w: ONNXWeights, prefix: str) -> None:
     """PredUpsampleBlock: pool, conv1x1, norm1, conv1, norm2, conv2."""
-    # pool: float16 ConvTranspose1d
+    # pool: float ConvTranspose1d
     pool_w = w.raw(f"{prefix}.pool.weight").astype(np.float32)  # (128, 1, 3)
     # ConvTranspose1d weight layout is (in_ch, out_ch/groups, k) for grouped
     # For depthwise (groups=in_ch): weight is (in_ch, 1, k)
     blk.pool.weight.data.copy_(torch.from_numpy(pool_w))
     blk.pool.bias.data.copy_(torch.from_numpy(w.raw(f"{prefix}.pool.bias").astype(np.float32)))
 
-    _load_quantized_conv1d(blk.conv1x1, w, f"{prefix}.conv1x1.weight_quantized")
+    _load_conv1d_auto(blk.conv1x1, w, f"{prefix}.conv1x1")
     _load_adain1d(blk.norm1, w, f"{prefix}.norm1")
-    _load_quantized_conv1d(blk.conv1, w, f"{prefix}.conv1.weight_quantized", f"{prefix}.conv1.bias")
+    _load_conv1d_auto(blk.conv1, w, f"{prefix}.conv1", f"{prefix}.conv1.bias")
     _load_adain1d(blk.norm2, w, f"{prefix}.norm2")
-    _load_quantized_conv1d(blk.conv2, w, f"{prefix}.conv2.weight_quantized", f"{prefix}.conv2.bias")
+    _load_conv1d_auto(blk.conv2, w, f"{prefix}.conv2", f"{prefix}.conv2.bias")
 
 
-# LSTM group assignments (in ONNX order):
-# 7589 → text_encoder BiLSTM (already loaded)
-# 7816 → predictor.text_encoder lstms.0 (first pair, index 0)
-# 7872 → predictor.text_encoder lstms.2
-# 7928 → predictor.text_encoder lstms.4
-# 7984 → predictor.text_encoder lstms.6
-# 8040 → predictor.text_encoder lstms.8
-# 8096 → predictor.text_encoder lstms.10
-# 8151 → predictor.lstm (duration)
-# 8212 → predictor.shared
-
-_PRED_LSTM_GROUPS = [
-    ("7816", "7817", "7818"),  # lstms.0
-    ("7872", "7873", "7874"),  # lstms.2
-    ("7928", "7929", "7930"),  # lstms.4
-    ("7984", "7985", "7986"),  # lstms.6
-    ("8040", "8041", "8042"),  # lstms.8
-    ("8096", "8097", "8098"),  # lstms.10
-]
-
-
-def _load_predictor(predictor, w: ONNXWeights) -> None:
+def _load_predictor(predictor, w: ONNXWeights, lstm_groups: list[int], matmul_fp: list[int]) -> None:
+    # LSTM group assignments (by sorted order, v0.8-int8):
+    #   lstm_groups[0]   → text_encoder BiLSTM (loaded in _load_text_encoder)
+    #   lstm_groups[1-2] → predictor.text_encoder lstms[0,2] (2 BiLSTMs)
+    #   lstm_groups[3]   → predictor.lstm (duration)
+    #   lstm_groups[4]   → predictor.shared
     pp = "kmodel.predictor"
 
-    # text_encoder: 6 BiLSTMs at lstms[0,2,4,6,8,10] + FCs at lstms[1,3,5,7,9,11]
-    for layer_idx, (b_group, wih_group, whh_group) in enumerate(_PRED_LSTM_GROUPS):
-        lstm_idx = layer_idx * 2  # 0, 2, 4, 6, 8, 10
-        fc_idx = lstm_idx + 1     # 1, 3, 5, 7, 9, 11
-        lstm_mod = predictor.text_encoder.lstms[lstm_idx]
-        fc_mod = predictor.text_encoder.lstms[fc_idx]
+    # text_encoder: 2 BiLSTMs at lstms[0,2] + FCs at lstms[1,3]
+    for layer_idx in range(2):
+        g = lstm_groups[1 + layer_idx]
+        lstm_idx = layer_idx * 2  # 0, 2
+        fc_idx = lstm_idx + 1     # 1, 3
 
         _load_lstm_weights(
-            lstm_mod,
-            w_ih_q=w.raw(f"onnx::LSTM_{wih_group}_quantized"),
-            w_ih_scale=w.raw(f"onnx::LSTM_{wih_group}_scale"),
-            w_ih_zp=w.raw(f"onnx::LSTM_{wih_group}_zero_point"),
-            w_hh_q=w.raw(f"onnx::LSTM_{whh_group}_quantized"),
-            w_hh_scale=w.raw(f"onnx::LSTM_{whh_group}_scale"),
-            w_hh_zp=w.raw(f"onnx::LSTM_{whh_group}_zero_point"),
-            bias=w.raw(f"onnx::LSTM_{b_group}"),
+            predictor.text_encoder.lstms[lstm_idx],
+            w_ih_q=w.raw(f"onnx::LSTM_{g + 1}_quantized"),
+            w_ih_scale=w.raw(f"onnx::LSTM_{g + 1}_scale"),
+            w_ih_zp=w.raw(f"onnx::LSTM_{g + 1}_zero_point"),
+            w_hh_q=w.raw(f"onnx::LSTM_{g + 2}_quantized"),
+            w_hh_scale=w.raw(f"onnx::LSTM_{g + 2}_scale"),
+            w_hh_zp=w.raw(f"onnx::LSTM_{g + 2}_zero_point"),
+            bias=w.raw(f"onnx::LSTM_{g}"),
         )
 
-        # FC: lstms.{fc_idx}.fc
         fc_w_name = f"{pp}.text_encoder.lstms.{fc_idx}.fc.weight_quantized"
         if fc_w_name not in w:
-            # lstms.11 is float16
             fc_w_name = f"{pp}.text_encoder.lstms.{fc_idx}.fc.weight"
         _load_quantized_linear(
-            fc_mod, w,
+            predictor.text_encoder.lstms[fc_idx], w,
             fc_w_name,
             f"{pp}.text_encoder.lstms.{fc_idx}.fc.bias",
         )
 
-    # Duration LSTM (group 8151)
+    # Duration LSTM — lstm_groups[3]
+    g3 = lstm_groups[3]
     _load_lstm_weights(
         predictor.lstm,
-        w_ih_q=w.raw("onnx::LSTM_8152_quantized"),
-        w_ih_scale=w.raw("onnx::LSTM_8152_scale"),
-        w_ih_zp=w.raw("onnx::LSTM_8152_zero_point"),
-        w_hh_q=w.raw("onnx::LSTM_8153_quantized"),
-        w_hh_scale=w.raw("onnx::LSTM_8153_scale"),
-        w_hh_zp=w.raw("onnx::LSTM_8153_zero_point"),
-        bias=w.raw("onnx::LSTM_8151"),
+        w_ih_q=w.raw(f"onnx::LSTM_{g3 + 1}_quantized"),
+        w_ih_scale=w.raw(f"onnx::LSTM_{g3 + 1}_scale"),
+        w_ih_zp=w.raw(f"onnx::LSTM_{g3 + 1}_zero_point"),
+        w_hh_q=w.raw(f"onnx::LSTM_{g3 + 2}_quantized"),
+        w_hh_scale=w.raw(f"onnx::LSTM_{g3 + 2}_scale"),
+        w_hh_zp=w.raw(f"onnx::LSTM_{g3 + 2}_zero_point"),
+        bias=w.raw(f"onnx::LSTM_{g3}"),
     )
 
-    # Duration projection: Linear(128, 50), weight is float16 (128, 50)
-    arr = w.raw("onnx::MatMul_8154").astype(np.float32)  # (128, 50)
-    predictor.duration_proj.weight.data.copy_(torch.from_numpy(arr.T))  # (50, 128)
+    # Duration projection: Linear(128, 50) — matmul_fp[8]
+    arr = w.raw(f"onnx::MatMul_{matmul_fp[8]}").astype(np.float32)
+    predictor.duration_proj.weight.data.copy_(torch.from_numpy(arr.T))
     predictor.duration_proj.bias.data.copy_(w.get(f"{pp}.duration_proj.linear_layer.bias"))
 
-    # Shared LSTM (group 8212)
+    # Shared LSTM — lstm_groups[4]
+    g4 = lstm_groups[4]
     _load_lstm_weights(
         predictor.shared,
-        w_ih_q=w.raw("onnx::LSTM_8213_quantized"),
-        w_ih_scale=w.raw("onnx::LSTM_8213_scale"),
-        w_ih_zp=w.raw("onnx::LSTM_8213_zero_point"),
-        w_hh_q=w.raw("onnx::LSTM_8214_quantized"),
-        w_hh_scale=w.raw("onnx::LSTM_8214_scale"),
-        w_hh_zp=w.raw("onnx::LSTM_8214_zero_point"),
-        bias=w.raw("onnx::LSTM_8212"),
+        w_ih_q=w.raw(f"onnx::LSTM_{g4 + 1}_quantized"),
+        w_ih_scale=w.raw(f"onnx::LSTM_{g4 + 1}_scale"),
+        w_ih_zp=w.raw(f"onnx::LSTM_{g4 + 1}_zero_point"),
+        w_hh_q=w.raw(f"onnx::LSTM_{g4 + 2}_quantized"),
+        w_hh_scale=w.raw(f"onnx::LSTM_{g4 + 2}_scale"),
+        w_hh_zp=w.raw(f"onnx::LSTM_{g4 + 2}_zero_point"),
+        bias=w.raw(f"onnx::LSTM_{g4}"),
     )
 
     # F0 ResBlocks
@@ -480,9 +552,9 @@ def _load_adain_resblock(blk, w: ONNXWeights, prefix: str) -> None:
 
 
 def _load_decoder(decoder, w: ONNXWeights) -> None:
-    dp = "kmodel.decoder.decoder"
+    dp = "kmodel.decoder"
 
-    # asr_res: Conv1d(512, 64, k=1)
+    # asr_res: Conv1d(128, 64, k=1)
     _load_quantized_conv1d(decoder.asr_res, w,
                            f"{dp}.asr_res.0.weight_quantized")
     decoder.asr_res.bias.data.copy_(w.get(f"{dp}.asr_res.0.bias"))
@@ -518,12 +590,12 @@ def _load_gen_resblock(blk, w: ONNXWeights, prefix: str) -> None:
                                f"{prefix}.convs2.{i}.bias")
 
 
-def _load_generator(gen, w: ONNXWeights) -> None:
-    gp = "kmodel.decoder.decoder.generator"
+def _load_generator(gen, w: ONNXWeights, matmul_fp: list[int]) -> None:
+    gp = "kmodel.decoder.generator"
 
-    # SineGenerator linear: float32 (9, 1)
+    # SineGenerator linear: float32 (9, 1) — matmul_fp[9] (last in order)
     gen.sine_gen.l_linear.weight.data.copy_(
-        torch.from_numpy(w.raw("onnx::MatMul_8321").astype(np.float32).T)  # (1, 9)
+        torch.from_numpy(w.raw(f"onnx::MatMul_{matmul_fp[9]}").astype(np.float32).T)
     )
     # Sine linear bias might not exist; check
     # m_source.l_linear.bias: (1,)
@@ -551,11 +623,8 @@ def _load_generator(gen, w: ONNXWeights) -> None:
     for i, rb in enumerate(gen.resblocks):
         _load_gen_resblock(rb, w, f"{gp}.resblocks.{i}")
 
-    # conv_post (float16)
-    arr_w = w.raw(f"{gp}.conv_post.weight").astype(np.float32)
-    arr_b = w.raw(f"{gp}.conv_post.bias").astype(np.float32)
-    gen.conv_post.weight.data.copy_(torch.from_numpy(arr_w))
-    gen.conv_post.bias.data.copy_(torch.from_numpy(arr_b))
+    # conv_post
+    _load_conv1d_auto(gen.conv_post, w, f"{gp}.conv_post", f"{gp}.conv_post.bias")
 
     # STFT filters
     for attr_name in ["weight_forward_real", "weight_forward_imag",

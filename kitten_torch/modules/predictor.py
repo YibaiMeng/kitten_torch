@@ -4,12 +4,11 @@ Predictor module.
 Architecture (from ONNX weight analysis):
   Input: concat(text_cnn_lstm: 128, bert_encoder: 128) = 256-dim
 
-  text_encoder (6 stacked BiLSTMs):
+  text_encoder (2 stacked BiLSTMs):
     lstms.0: BiLSTM(256 → H=64) → 128
     lstms.1.fc: Linear(128, 256)
     lstms.2: BiLSTM(256 → H=64) → 128
     lstms.3.fc: Linear(128, 256)
-    ... × 6 total
     Output: 256-dim
 
   Duration branch:
@@ -161,7 +160,7 @@ class PredUpsampleBlock(nn.Module):
 
 class PredTextEncoder(nn.Module):
     """
-    6 BiLSTM layers with style-conditioned AdaIN after each.
+    N BiLSTM layers with style-conditioned AdaIN after each (v0.8: n_layers=2).
 
     Architecture (verified from ONNX):
       Initial input: cat([bert_out (128), style_half (128)]) = 256-dim
@@ -176,7 +175,7 @@ class PredTextEncoder(nn.Module):
     lstms[even] = BiLSTM, lstms[odd] = FC(style_half→256)
     """
 
-    def __init__(self, hidden: int = 64, n_layers: int = 6, style_half: int = 128):
+    def __init__(self, hidden: int = 64, n_layers: int = 2, style_half: int = 128):
         super().__init__()
         lstm_in = style_half * 2  # 256 = 128 bert + 128 style
         lstm_out = hidden * 2     # 128
@@ -271,7 +270,7 @@ class Predictor(nn.Module):
 
     def __init__(self, style_half: int = 128):
         super().__init__()
-        self.text_encoder = PredTextEncoder(hidden=64, n_layers=6, style_half=style_half)
+        self.text_encoder = PredTextEncoder(hidden=64, n_layers=2, style_half=style_half)
 
         # Duration branch
         self.lstm = nn.LSTM(256, 64, batch_first=True, bidirectional=True)

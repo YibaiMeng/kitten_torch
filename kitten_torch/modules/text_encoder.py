@@ -37,19 +37,21 @@ class CNNLayerNorm(nn.Module):
 
 class TextEncoder(nn.Module):
     """
-    Maps token ids → (B, T, 512) for decoder input.
-    Also exposes intermediate 128-dim output for the predictor.
+    Maps token ids → (B, T, 128) for decoder input.
+
+    v0.8 architecture: 2 CNN blocks (down from 6), no separate text_proj.
+    text_proj = h_lstm = 128-dim BiLSTM output.
     """
 
     def __init__(self, vocab_size: int = 178, d_model: int = 128):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.cnn = nn.ModuleList([CNNLayerNorm(d_model) for _ in range(6)])
+        self.cnn = nn.ModuleList([CNNLayerNorm(d_model) for _ in range(2)])
         # BiLSTM: hidden_size=64 per direction → output=128
         self.lstm = nn.LSTM(
             d_model, 64, num_layers=1, batch_first=True, bidirectional=True
         )
-        self.text_proj = nn.Linear(128, 512)
+        # No text_proj in v0.8: decoder takes 128-dim features directly
 
     def forward(
         self, input_ids: torch.Tensor
@@ -59,8 +61,8 @@ class TextEncoder(nn.Module):
             input_ids: (B, T) int64
 
         Returns:
-            h_proj: (B, T, 512)  — for decoder
-            h_lstm: (B, T, 128)  — for predictor
+            h_lstm: (B, T, 128)  — for decoder (text_proj) and predictor
+            h_lstm: (B, T, 128)  — same tensor returned twice for API compat
         """
         x = self.embedding(input_ids)   # (B, T, 128)
         x = x.transpose(1, 2)           # (B, 128, T) for Conv1d
@@ -68,5 +70,4 @@ class TextEncoder(nn.Module):
             x = layer(x)
         x = x.transpose(1, 2)           # (B, T, 128) for LSTM
         h_lstm, _ = self.lstm(x)        # (B, T, 128)
-        h_proj = self.text_proj(h_lstm) # (B, T, 512)
-        return h_proj, h_lstm
+        return h_lstm, h_lstm
