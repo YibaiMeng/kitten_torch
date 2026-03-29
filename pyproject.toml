@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "kitten-torch"
+version = "0.1.0"
+description = "PyTorch reconstruction of KittenTTS (kitten-tts-nano)"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24",
+    "onnx>=1.14",
+    "onnxruntime>=1.16",
+    "soundfile>=0.12",
+    "huggingface-hub>=0.20",
+    "phonemizer>=3.2",
+    "espeakng-loader>=0.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kitten_torch*"]

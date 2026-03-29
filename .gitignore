@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.onnx
+*.npz
+*.wav
+*.mp3
+/outputs/
+/audio_samples/
+/ab_test/
+/blind_test/
+.env
